@@ -1,84 +1,119 @@
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+module suiroad::swap {
+    use sui::dynamic_object_field::{Self as dof};
 
-module swap_products::suiroad {
-    use sui::balance::{Self, Balance};
-    use sui::coin::{Self, Coin};
-    use sui::object::{Self, UID};
-    use sui::sui::SUI;
-    use sui::transfer;
-    use sui::tx_context::{Self, TxContext};
+    public struct LockedObjectKey has copy, store, drop {}
 
-    const MIN_FEE: u64 = 1000;
-
-    struct Object has key, store {
+    public struct Locked<phantom T: key + store> has key, store {
         id: UID,
-        scarcity: u8,
-        style: u8,
+        key: ID,
     }
 
-    struct ObjectWrapper has key {
+    /// Key to open a locked object (consuming the `Key`)
+    public struct Key has key, store { id: UID }
+
+    public struct Escrow<T: key + store> has key {
         id: UID,
-        original_owner: address,
-        to_swap: Object,
-        fee: Balance<SUI>,
+        sender: address,
+        recipient: address,
+        exchange_key: ID,
+        escrowed_key: ID,
+        escrowed: T,
     }
 
-    public entry fun create_object(scarcity: u8, style: u8, ctx: &mut TxContext) {
-        let object = Object {
+    // === Error codes ===
+
+    /// The `sender` and `recipient` of the two escrowed objects do not match
+    const EMismatchedSenderRecipient: u64 = 0;
+
+    /// The `exchange_key` fields of the two escrowed objects do not match
+    const EMismatchedExchangeObject: u64 = 1;
+
+    /// The key does not match this lock.
+    const ELockKeyMismatch: u64 = 2;
+
+    // === Public Functions ===
+    public fun create<T: key + store>(
+        key: Key,
+        locked: Locked<T>,
+        exchange_key: ID,
+        recipient: address,
+        custodian: address,
+        ctx: &mut TxContext,
+    ) {
+        let escrow = Escrow {
             id: object::new(ctx),
-            scarcity,
-            style,
+            sender: ctx.sender(),
+            recipient,
+            exchange_key,
+            escrowed_key: object::id(&key),
+            escrowed: locked.unlock(key),
         };
-        transfer::public_transfer(object, tx_context::sender(ctx))
+
+        transfer::transfer(escrow, custodian);
     }
 
-    /// Anyone owns an `Object` can request swapping their object. This object
-    /// will be wrapped into `ObjectWrapper` and sent to `service_address`.
-    public entry fun request_swap(object: Object, fee: Coin<SUI>, service_address: address, ctx: &mut TxContext) {
-        assert!(coin::value(&fee) >= MIN_FEE, 0);
-        let wrapper = ObjectWrapper {
-            id: object::new(ctx),
-            original_owner: tx_context::sender(ctx),
-            to_swap: object,
-            fee: coin::into_balance(fee),
-        };
-        transfer::transfer(wrapper, service_address);
-    }
-
-    /// When the admin has two swap requests with objects that are trade-able,
-    /// the admin can execute the swap and send them back to the opposite owner.
-    public entry fun execute_swap(wrapper1: ObjectWrapper, wrapper2: ObjectWrapper, ctx: &mut TxContext) {
-        // Only swap if their scarcity is the same and style is different.
-        assert!(wrapper1.to_swap.scarcity == wrapper2.to_swap.scarcity, 0);
-        assert!(wrapper1.to_swap.style != wrapper2.to_swap.style, 0);
-
-        // Unpack both wrappers, cross send them to the other owner.
-        let ObjectWrapper {
+    public fun swap<T: key + store, U: key + store>(
+        obj1: Escrow<T>,
+        obj2: Escrow<U>,
+    ) {
+        let Escrow {
             id: id1,
-            original_owner: original_owner1,
-            to_swap: object1,
-            fee: fee1,
-        } = wrapper1;
+            sender: sender1,
+            recipient: recipient1,
+            exchange_key: exchange_key1,
+            escrowed_key: escrowed_key1,
+            escrowed: escrowed1,
+        } = obj1;
 
-        let ObjectWrapper {
+        let Escrow {
             id: id2,
-            original_owner: original_owner2,
-            to_swap: object2,
-            fee: fee2,
-        } = wrapper2;
+            sender: sender2,
+            recipient: recipient2,
+            exchange_key: exchange_key2,
+            escrowed_key: escrowed_key2,
+            escrowed: escrowed2,
+        } = obj2;
+        id1.delete();
+        id2.delete();
 
-        // Perform the swap.
-        transfer::transfer(object1, original_owner2);
-        transfer::transfer(object2, original_owner1);
+        // Make sure the sender and recipient match each other
+        assert!(sender1 == recipient2, EMismatchedSenderRecipient);
+        assert!(sender2 == recipient1, EMismatchedSenderRecipient);
 
-        // Service provider takes the fee.
-        let service_address = tx_context::sender(ctx);
-        balance::join(&mut fee1, fee2);
-        transfer::public_transfer(coin::from_balance(fee1, ctx), service_address);
+        // Make sure the objects match each other and haven't been modified
+        // (they remain locked).
+        assert!(escrowed_key1 == exchange_key2, EMismatchedExchangeObject);
+        assert!(escrowed_key2 == exchange_key1, EMismatchedExchangeObject);
 
-        // Effectively delete the wrapper objects.
-        object::delete(id1);
-        object::delete(id2);
+        // Do the actual swap
+        transfer::public_transfer(escrowed1, recipient1);
+        transfer::public_transfer(escrowed2, recipient2);
+    }
+
+    /// The custodian can always return an escrowed object to its original
+    /// owner.
+    public fun return_to_sender<T: key + store>(obj: Escrow<T>) {
+        let Escrow {
+            id,
+            sender,
+            recipient: _,
+            exchange_key: _,
+            escrowed_key: _,
+            escrowed,
+        } = obj;
+        id.delete();
+        transfer::public_transfer(escrowed, sender);
+    }
+
+    public fun unlock<T: key + store>(mut locked: Locked<T>, key: Key): T {
+        assert!(locked.key == object::id(&key), ELockKeyMismatch);
+        let Key { id } = key;
+        id.delete();
+
+        let obj = dof::remove<LockedObjectKey, T>(&mut locked.id, LockedObjectKey {});
+
+        let Locked { id, key: _ } = locked;
+        id.delete();
+        obj
     }
 }
